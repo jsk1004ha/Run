@@ -1,0 +1,1 @@
+Trigger export of the current Zed LSP log-store source for an exact bounded-ingress candidate.
