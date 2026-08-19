@@ -1,0 +1,33 @@
+name: Export Zed LSP log store source
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    if: startsWith(github.head_ref, 'agent/zed-source-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone current Zed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --depth=1 https://github.com/zed-industries/zed.git source
+          mkdir -p snapshot/crates/project/src/lsp_store snapshot/crates/project
+          cp source/crates/project/src/lsp_store/log_store.rs snapshot/crates/project/src/lsp_store/
+          cp source/crates/project/Cargo.toml snapshot/crates/project/
+          cp source/Cargo.toml source/Cargo.lock snapshot/
+          git -C source rev-parse HEAD > snapshot/upstream-sha.txt
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-lsp-log-store-source
+          path: snapshot
+          if-no-files-found: error
+          retention-days: 3
