@@ -1,0 +1,109 @@
+name: Validate Tempo global queue admission limits
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: startsWith(github.head_ref, 'agent/tempo-validation-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out validation input
+        uses: actions/checkout@v4
+
+      - name: Decode and verify candidate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 --decode ci/tempo_global_queue_admission_limits.patch.gz.b64 > /tmp/candidate.patch.gz
+          echo '9726cb68d3cbd580ecf68fb3f70dfb71c75ddc764464ac8d8f43b5a13709d238  /tmp/candidate.patch.gz' | sha256sum -c -
+          gzip -dc /tmp/candidate.patch.gz > /tmp/candidate.patch
+          echo '2235aabf6539a8c34bc26f2e58d76150bd8844e37e10fa925b626fa9983c1efc  /tmp/candidate.patch' | sha256sum -c -
+          mkdir -p validation-output
+          cp /tmp/candidate.patch validation-output/candidate.patch
+
+      - name: Clone current Tempo main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --depth=1 https://github.com/grafana/tempo.git source
+          git -C source rev-parse HEAD | tee validation-output/upstream-sha.txt
+
+      - name: Set up Go from upstream go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache-dependency-path: source/go.sum
+
+      - name: Apply and format candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          git apply --check /tmp/candidate.patch
+          git apply /tmp/candidate.patch
+          gofmt -w modules/frontend/queue/queue.go modules/frontend/queue/queue_test.go modules/frontend/v1/frontend.go
+          git diff --check
+          git diff -- modules/frontend/queue/queue.go modules/frontend/queue/queue_test.go modules/frontend/v1/frontend.go > ../validation-output/applied.diff
+
+      - name: Test frontend queue package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          go test ./modules/frontend/queue 2>&1 | tee ../validation-output/go-test-queue.log
+
+      - name: Race-test frontend queue package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          go test -race ./modules/frontend/queue 2>&1 | tee ../validation-output/go-test-race-queue.log
+
+      - name: Test frontend v1 package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          go test ./modules/frontend/v1 2>&1 | tee ../validation-output/go-test-frontend-v1.log
+
+      - name: Test frontend package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          go test ./modules/frontend 2>&1 | tee ../validation-output/go-test-frontend.log
+
+      - name: Vet changed packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          go vet ./modules/frontend/queue ./modules/frontend/v1 2>&1 | tee ../validation-output/go-vet.log
+
+      - name: Record environment and final state
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p validation-output
+          { go version; go env GOOS GOARCH GOVERSION; } > validation-output/go-environment.txt 2>&1
+          if [ -d source/.git ]; then
+            git -C source status --short > validation-output/git-status.txt
+            git -C source diff --check > validation-output/diff-check.txt 2>&1
+            git -C source diff -- modules/frontend/queue/queue.go modules/frontend/queue/queue_test.go modules/frontend/v1/frontend.go > validation-output/final.diff
+          fi
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempo-global-queue-validation
+          path: validation-output
+          if-no-files-found: error
+          retention-days: 7
