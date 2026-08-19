@@ -1,0 +1,126 @@
+name: Validate Zed LSP I/O ingress budget
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: startsWith(github.head_ref, 'agent/zed-validation-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out validation input
+        uses: actions/checkout@v4
+
+      - name: Decode and verify candidate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 --decode ci/zed_lsp_io_ingress_budget.patch.gz.b64 > /tmp/candidate.patch.gz
+          echo '376d774636f6f1fda0d29affb5409df75477e40eb992f05ff9bf6be07faa9702  /tmp/candidate.patch.gz' | sha256sum -c -
+          gzip -dc /tmp/candidate.patch.gz > /tmp/candidate.patch
+          echo '3571bd8605fe92a41e84032a7a72914f1c0ba16ab45598b1100751538a336ef1  /tmp/candidate.patch' | sha256sum -c -
+          mkdir -p validation-output
+          cp /tmp/candidate.patch validation-output/candidate.patch
+
+      - name: Clone current Zed main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --depth=1 https://github.com/zed-industries/zed.git source
+          git -C source rev-parse HEAD | tee validation-output/upstream-sha.txt
+
+      - name: Install Zed Linux dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          ./script/linux 2>&1 | tee ../validation-output/linux-dependencies.log
+
+      - name: Record Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          rustup show active-toolchain | tee ../validation-output/rust-toolchain.txt
+          rustc --version | tee -a ../validation-output/rust-toolchain.txt
+          cargo --version | tee -a ../validation-output/rust-toolchain.txt
+
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+          cache-on-failure: true
+          shared-key: zed-project-validation
+
+      - name: Apply and format candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          git apply --check /tmp/candidate.patch
+          git apply /tmp/candidate.patch
+          cargo fmt --all
+          git diff --check
+          git diff -- crates/project/src/lsp_store/log_store.rs crates/project/tests/integration/lsp_store.rs > ../validation-output/applied.diff
+
+      - name: Test bounded ingress budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          cargo test -p project --features test-support --test integration io_queue_budget -- --nocapture 2>&1 | tee ../validation-output/cargo-test-io-budget.log
+
+      - name: Test nearby RPC log bookkeeping
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          cargo test -p project --features test-support --test integration rpc_request_tracker -- --nocapture 2>&1 | tee ../validation-output/cargo-test-rpc-tracker.log
+
+      - name: Check project crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          cargo check -p project --features test-support 2>&1 | tee ../validation-output/cargo-check-project.log
+
+      - name: Clippy changed test target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          cargo clippy -p project --features test-support --test integration --no-deps -- -D warnings 2>&1 | tee ../validation-output/cargo-clippy.log
+
+      - name: Verify formatting is stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          cargo fmt --all -- --check 2>&1 | tee ../validation-output/cargo-fmt-check.log
+          git diff --check
+
+      - name: Record final state
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p validation-output
+          if [ -d source/.git ]; then
+            git -C source status --short > validation-output/git-status.txt
+            git -C source diff --check > validation-output/diff-check.txt 2>&1
+            git -C source diff -- crates/project/src/lsp_store/log_store.rs crates/project/tests/integration/lsp_store.rs > validation-output/final.diff
+          fi
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-lsp-ingress-validation
+          path: validation-output
+          if-no-files-found: error
+          retention-days: 7
